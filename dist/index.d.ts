@@ -17,5 +17,6 @@ export declare function resolvePerlPath(options: {
     whichPerl: () => string | null;
     fileExists: (path: string) => boolean;
 }): string;
+export declare function isMissingCrontabError(status: number | undefined, stderr: string): boolean;
 export declare const SchedulerPlugin: Plugin;
 export default SchedulerPlugin;

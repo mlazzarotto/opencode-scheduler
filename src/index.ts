@@ -15,7 +15,7 @@ import type { Plugin } from "@opencode-ai/plugin"
 import { tool } from "@opencode-ai/plugin"
 import { createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync, unlinkSync } from "fs"
 import { basename, dirname, join, resolve as resolvePath } from "path"
-import { homedir, platform } from "os"
+import { homedir, platform, tmpdir } from "os"
 import { execFileSync, execSync, spawn, type ChildProcess } from "child_process"
 import { fileURLToPath } from "url"
 
@@ -656,7 +656,18 @@ function findOpencode(): string {
     }
   }
 
-  return "opencode" // hope it's in PATH
+  // cron fires jobs with a minimal PATH, so returning a bare command name would
+  // install a schedule that fails at run time. Windows Task Scheduler resolves
+  // the command itself, so keep the previous behavior there.
+  if (IS_WINDOWS) return "opencode"
+
+  throw new Error(
+    [
+      "Could not locate the opencode binary.",
+      "Scheduled runs use a minimal PATH, so a bare command name is not reliable.",
+      "Add opencode to PATH, or set OPENCODE_SCHEDULER_OPENCODE_PATH to the absolute path of the binary.",
+    ].join(" ")
+  )
 }
 
 // Get PATH that includes common locations for node/npx
@@ -1372,6 +1383,32 @@ function isCronAvailable(): boolean {
   return isCommandAvailable("crontab")
 }
 
+function isOpenRcAvailable(): boolean {
+  if (!IS_LINUX) return false
+  return existsSync("/sbin/rc-service") || isCommandAvailable("rc-service")
+}
+
+// cron entries only fire while the cron daemon runs. On OpenRC systems
+// (Alpine) the daemon is the `crond` service; installing a crontab without
+// it silently does nothing, so surface an actionable hint.
+function getCronDaemonHint(): string | null {
+  if (!IS_LINUX) return null
+
+  if (isOpenRcAvailable()) {
+    try {
+      execSync("rc-service crond status", {
+        stdio: "ignore",
+        env: buildRunEnvironment(),
+      })
+      return null
+    } catch {
+      return "The OpenRC crond service is not running, so the job will not fire. Start it with: rc-service crond start && rc-update add crond default"
+    }
+  }
+
+  return null
+}
+
 function cronBlockId(job: Job): string {
   const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir())
   return `${scopeId}:${job.slug}`
@@ -1393,6 +1430,15 @@ function shellEscapeDoubleQuoted(value: string): string {
   return value.replace(/(["\\$`])/g, "\\$1")
 }
 
+// Distinguish "this user has no crontab yet" from real crontab failures.
+// vixie/cronie print "no crontab for <user>"; busybox (Alpine) prints
+// "crontab: can't open '<user>': No such file or directory" instead.
+export function isMissingCrontabError(status: number | undefined, stderr: string): boolean {
+  if (status !== 1) return false
+  if (!stderr.trim()) return true
+  return /no crontab/i.test(stderr) || /can't open .*no such file or directory/i.test(stderr)
+}
+
 function readUserCrontab(): string {
   try {
     return execFileSync("crontab", ["-l"], { encoding: "utf-8" }) as string
@@ -1403,8 +1449,7 @@ function readUserCrontab(): string {
         ? (error as { stderr?: string | Buffer }).stderr
         : undefined
     const stderr = Buffer.isBuffer(stderrValue) ? stderrValue.toString("utf-8") : (stderrValue ?? "")
-    const noCrontab = status === 1 && (!stderr.trim() || /no crontab/i.test(stderr))
-    if (noCrontab) return ""
+    if (isMissingCrontabError(status, stderr)) return ""
     throw error
   }
 }
@@ -1412,7 +1457,18 @@ function readUserCrontab(): string {
 function writeUserCrontab(content: string): void {
   const normalized = content.trim()
   const input = normalized ? `${normalized}\n` : ""
-  execFileSync("crontab", ["-"], { input })
+  // Install from a temp file: `crontab <file>` is supported by every
+  // implementation, while stdin (`crontab -`) is not (e.g. older busybox
+  // builds shipped by Alpine).
+  const tmpPath = join(tmpdir(), `opencode-scheduler-crontab-${process.pid}-${Date.now()}.tmp`)
+  try {
+    writeFileSync(tmpPath, input, { mode: 0o600 })
+    execFileSync("crontab", [tmpPath])
+  } finally {
+    try {
+      unlinkSync(tmpPath)
+    } catch {}
+  }
 }
 
 function stripManagedCronBlocks(content: string, blockIds: Set<string>): { content: string; removed: number } {
@@ -2749,6 +2805,8 @@ export const SchedulerPlugin: Plugin = async () => {
                : backend === "cron"
                  ? "Cron note: missed runs during sleep are not replayed. For catch-up behavior, use launchd or systemd when available."
                  : "The job will run at the scheduled time. If your computer was asleep, it will catch up when it wakes."
+             const cronDaemonHint = backend === "cron" ? getCronDaemonHint() : null
+             const cronDaemonWarning = cronDaemonHint ? `\n\nWarning: ${cronDaemonHint}` : ""
              const primaryLine = run.command
                ? `Command: ${run.command}${run.arguments ? ` ${run.arguments}` : ""}`
                : `Prompt: ${(run.prompt ?? "").slice(0, 100)}${(run.prompt ?? "").length > 100 ? "..." : ""}`
@@ -2765,7 +2823,7 @@ Platform: ${platformName}
 Working Directory: ${workdir}
 ${attachLine}${primaryLine}
 
-${reliabilityLine}
+${reliabilityLine}${cronDaemonWarning}
 
 Commands:
 - "run ${args.name} now" - run immediately
@@ -3140,7 +3198,7 @@ Commands:
             }
 
             saveJob(updatedJob)
-            installJob(updatedJob)
+            const backend = installJob(updatedJob)
 
             if (scopeChanged) {
               // Remove the old job file if it exists.
@@ -3151,7 +3209,11 @@ Commands:
                 } catch {}
               }
             }
-            return okResult(format, `Updated job "${updatedJob.name}"`, { job: updatedJob })
+            const cronDaemonHint = backend === "cron" ? getCronDaemonHint() : null
+            const updateOutput = cronDaemonHint
+              ? `Updated job "${updatedJob.name}"\n\nWarning: ${cronDaemonHint}`
+              : `Updated job "${updatedJob.name}"`
+            return okResult(format, updateOutput, { job: updatedJob })
           } catch (error) {
             const msg = error instanceof Error ? error.message : String(error)
             // Best-effort rollback: restore original job and schedule.

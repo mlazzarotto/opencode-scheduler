@@ -12346,7 +12346,7 @@ tool.schema = exports_external;
 // src/index.ts
 import { createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync, unlinkSync } from "fs";
 import { basename, dirname, join, resolve as resolvePath } from "path";
-import { homedir, platform } from "os";
+import { homedir, platform, tmpdir } from "os";
 import { execFileSync, execSync, spawn } from "child_process";
 import { fileURLToPath } from "url";
 var OPENCODE_CONFIG = join(homedir(), ".config", "opencode");
@@ -12861,7 +12861,13 @@ function findOpencode() {
       return p;
     }
   }
-  return "opencode";
+  if (IS_WINDOWS)
+    return "opencode";
+  throw new Error([
+    "Could not locate the opencode binary.",
+    "Scheduled runs use a minimal PATH, so a bare command name is not reliable.",
+    "Add opencode to PATH, or set OPENCODE_SCHEDULER_OPENCODE_PATH to the absolute path of the binary."
+  ].join(" "));
 }
 function getEnhancedPath() {
   const paths = [
@@ -13404,6 +13410,27 @@ function isCronAvailable() {
     return false;
   return isCommandAvailable("crontab");
 }
+function isOpenRcAvailable() {
+  if (!IS_LINUX)
+    return false;
+  return existsSync("/sbin/rc-service") || isCommandAvailable("rc-service");
+}
+function getCronDaemonHint() {
+  if (!IS_LINUX)
+    return null;
+  if (isOpenRcAvailable()) {
+    try {
+      execSync("rc-service crond status", {
+        stdio: "ignore",
+        env: buildRunEnvironment()
+      });
+      return null;
+    } catch {
+      return "The OpenRC crond service is not running, so the job will not fire. Start it with: rc-service crond start && rc-update add crond default";
+    }
+  }
+  return null;
+}
 function cronBlockId(job) {
   const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir());
   return `${scopeId}:${job.slug}`;
@@ -13420,6 +13447,13 @@ function cronBlockEnd(id) {
 function shellEscapeDoubleQuoted(value) {
   return value.replace(/(["\\$`])/g, "\\$1");
 }
+function isMissingCrontabError(status, stderr) {
+  if (status !== 1)
+    return false;
+  if (!stderr.trim())
+    return true;
+  return /no crontab/i.test(stderr) || /can't open .*no such file or directory/i.test(stderr);
+}
 function readUserCrontab() {
   try {
     return execFileSync("crontab", ["-l"], { encoding: "utf-8" });
@@ -13427,8 +13461,7 @@ function readUserCrontab() {
     const status = typeof error === "object" && error !== null ? error.status : undefined;
     const stderrValue = typeof error === "object" && error !== null && "stderr" in error ? error.stderr : undefined;
     const stderr = Buffer.isBuffer(stderrValue) ? stderrValue.toString("utf-8") : stderrValue ?? "";
-    const noCrontab = status === 1 && (!stderr.trim() || /no crontab/i.test(stderr));
-    if (noCrontab)
+    if (isMissingCrontabError(status, stderr))
       return "";
     throw error;
   }
@@ -13437,7 +13470,15 @@ function writeUserCrontab(content) {
   const normalized = content.trim();
   const input = normalized ? `${normalized}
 ` : "";
-  execFileSync("crontab", ["-"], { input });
+  const tmpPath = join(tmpdir(), `opencode-scheduler-crontab-${process.pid}-${Date.now()}.tmp`);
+  try {
+    writeFileSync(tmpPath, input, { mode: 384 });
+    execFileSync("crontab", [tmpPath]);
+  } finally {
+    try {
+      unlinkSync(tmpPath);
+    } catch {}
+  }
 }
 function stripManagedCronBlocks(content, blockIds) {
   const lines = content ? content.split(/\r?\n/) : [];
@@ -14520,6 +14561,10 @@ var SchedulerPlugin = async () => {
             const backend = installJob(job);
             const platformName = backend;
             const reliabilityLine = backend === "schtasks" ? "Windows note: scheduled runs use Task Scheduler directly. For advanced reliability guarantees, prefer simple cron schedules or split complex jobs." : backend === "cron" ? "Cron note: missed runs during sleep are not replayed. For catch-up behavior, use launchd or systemd when available." : "The job will run at the scheduled time. If your computer was asleep, it will catch up when it wakes.";
+            const cronDaemonHint = backend === "cron" ? getCronDaemonHint() : null;
+            const cronDaemonWarning = cronDaemonHint ? `
+
+Warning: ${cronDaemonHint}` : "";
             const primaryLine = run.command ? `Command: ${run.command}${run.arguments ? ` ${run.arguments}` : ""}` : `Prompt: ${(run.prompt ?? "").slice(0, 100)}${(run.prompt ?? "").length > 100 ? "..." : ""}`;
             const attachLine = run.attachUrl ? `Attach URL: ${run.attachUrl}
 ` : "";
@@ -14530,7 +14575,7 @@ Platform: ${platformName}
 Working Directory: ${workdir}
 ${attachLine}${primaryLine}
 
-${reliabilityLine}
+${reliabilityLine}${cronDaemonWarning}
 
 Commands:
 - "run ${args.name} now" - run immediately
@@ -14827,7 +14872,7 @@ ${content.trim()}
               uninstallJob(job);
             }
             saveJob(updatedJob);
-            installJob(updatedJob);
+            const backend = installJob(updatedJob);
             if (scopeChanged) {
               const oldPath = jobFilePath(oldScopeId, job.slug);
               if (existsSync(oldPath)) {
@@ -14836,7 +14881,11 @@ ${content.trim()}
                 } catch {}
               }
             }
-            return okResult(format, `Updated job "${updatedJob.name}"`, { job: updatedJob });
+            const cronDaemonHint = backend === "cron" ? getCronDaemonHint() : null;
+            const updateOutput = cronDaemonHint ? `Updated job "${updatedJob.name}"
+
+Warning: ${cronDaemonHint}` : `Updated job "${updatedJob.name}"`;
+            return okResult(format, updateOutput, { job: updatedJob });
           } catch (error) {
             const msg = error instanceof Error ? error.message : String(error);
             try {
@@ -15022,5 +15071,6 @@ var src_default = SchedulerPlugin;
 export {
   SchedulerPlugin,
   src_default as default,
+  isMissingCrontabError,
   resolvePerlPath
 };
