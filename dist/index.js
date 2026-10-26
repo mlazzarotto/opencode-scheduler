@@ -14280,9 +14280,9 @@ ${message}
     lastRunError: undefined
   });
   if (child.stdout)
-    child.stdout.pipe(logStream);
+    child.stdout.pipe(logStream, { end: false });
   if (child.stderr)
-    child.stderr.pipe(logStream);
+    child.stderr.pipe(logStream, { end: false });
   child.on("error", (error) => {
     logStream.write(`
 === Run error ${new Date().toISOString()} ===

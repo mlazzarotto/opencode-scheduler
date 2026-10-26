@@ -2449,8 +2449,10 @@ function runJobNow(job: Job): { startedAt: string; logPath: string; pid?: number
     lastRunError: undefined,
   })
 
-  if (child.stdout) child.stdout.pipe(logStream)
-  if (child.stderr) child.stderr.pipe(logStream)
+  // Keep the log stream open when the child's stdio closes: the completion
+  // handlers below write the final status line and end the stream themselves.
+  if (child.stdout) child.stdout.pipe(logStream, { end: false })
+  if (child.stderr) child.stderr.pipe(logStream, { end: false })
 
   child.on("error", (error) => {
     logStream.write(`\n=== Run error ${new Date().toISOString()} ===\n${error.message}\n`)
