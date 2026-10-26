@@ -1388,25 +1388,27 @@ function isOpenRcAvailable(): boolean {
   return existsSync("/sbin/rc-service") || isCommandAvailable("rc-service")
 }
 
-// cron entries only fire while the cron daemon runs. On OpenRC systems
-// (Alpine) the daemon is the `crond` service; installing a crontab without
-// it silently does nothing, so surface an actionable hint.
+// cron entries only fire while the cron daemon runs. Installing a crontab
+// without it silently does nothing, so surface an actionable hint.
+// OpenRC packages the daemon under different service names: `crond` on Alpine
+// (busybox/cronie) and `cron` on Gentoo-style systems (dcron/cronie).
+const OPENRC_CRON_SERVICES = ["crond", "cron"]
+
 function getCronDaemonHint(): string | null {
   if (!IS_LINUX) return null
+  if (!isOpenRcAvailable()) return null
 
-  if (isOpenRcAvailable()) {
+  for (const service of OPENRC_CRON_SERVICES) {
     try {
-      execSync("rc-service crond status", {
+      execSync(`rc-service ${service} status`, {
         stdio: "ignore",
         env: buildRunEnvironment(),
       })
       return null
-    } catch {
-      return "The OpenRC crond service is not running, so the job will not fire. Start it with: rc-service crond start && rc-update add crond default"
-    }
+    } catch {}
   }
 
-  return null
+  return "No OpenRC cron service is running, so the job will not fire. Start it with: rc-service crond start && rc-update add crond default (use your system's service name, e.g. `cron`, if it differs)"
 }
 
 function cronBlockId(job: Job): string {

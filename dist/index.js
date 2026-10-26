@@ -13415,21 +13415,22 @@ function isOpenRcAvailable() {
     return false;
   return existsSync("/sbin/rc-service") || isCommandAvailable("rc-service");
 }
+var OPENRC_CRON_SERVICES = ["crond", "cron"];
 function getCronDaemonHint() {
   if (!IS_LINUX)
     return null;
-  if (isOpenRcAvailable()) {
+  if (!isOpenRcAvailable())
+    return null;
+  for (const service of OPENRC_CRON_SERVICES) {
     try {
-      execSync("rc-service crond status", {
+      execSync(`rc-service ${service} status`, {
         stdio: "ignore",
         env: buildRunEnvironment()
       });
       return null;
-    } catch {
-      return "The OpenRC crond service is not running, so the job will not fire. Start it with: rc-service crond start && rc-update add crond default";
-    }
+    } catch {}
   }
-  return null;
+  return "No OpenRC cron service is running, so the job will not fire. Start it with: rc-service crond start && rc-update add crond default (use your system's service name, e.g. `cron`, if it differs)";
 }
 function cronBlockId(job) {
   const scopeId = job.scopeId || deriveScopeId(job.workdir || homedir());
