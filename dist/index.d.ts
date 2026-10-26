@@ -19,4 +19,9 @@ export declare function resolvePerlPath(options: {
 }): string;
 export declare function isMissingCrontabError(status: number | undefined, stderr: string): boolean;
 export declare const SchedulerPlugin: Plugin;
-export default SchedulerPlugin;
+declare const _default: {
+    id: string;
+    server: Plugin;
+    setup: (ctx: any) => Promise<void>;
+};
+export default _default;

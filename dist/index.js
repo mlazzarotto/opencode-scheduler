@@ -15068,7 +15068,71 @@ ${logs}`, { job, logPath, logs });
     }
   };
 };
-var src_default = SchedulerPlugin;
+var z = tool.schema;
+var SchedulerPluginV2 = {
+  id: "opencode-scheduler",
+  async setup(ctx) {
+    const directory = ctx?.location?.directory || process.cwd();
+    const worktree = directory;
+    const hooks = await SchedulerPlugin({
+      client: {},
+      project: {},
+      directory,
+      worktree,
+      experimental_workspace: { register() {} },
+      serverUrl: new URL("http://localhost:4096"),
+      $: async () => ({ stdout: "", stderr: "", exitCode: 0 })
+    });
+    const tools = hooks?.tool || {};
+    await ctx.tool.transform((draft) => {
+      for (const [name, definition] of Object.entries(tools)) {
+        try {
+          const input = z.toJSONSchema(z.object(definition.args || {}));
+          draft.add({
+            name,
+            description: definition.description || `Scheduled job tool: ${name}`,
+            input,
+            options: { codemode: false },
+            execute: async (input2, context) => {
+              const v1Context = {
+                sessionID: context?.sessionID ?? "",
+                messageID: context?.messageID ?? "",
+                agent: context?.agent ?? "orchestrator",
+                directory,
+                worktree,
+                abort: context?.abort instanceof AbortSignal ? context.abort : new AbortController().signal,
+                metadata() {},
+                async ask() {}
+              };
+              const result = await definition.execute(input2, v1Context);
+              if (typeof result === "string") {
+                return { content: result };
+              }
+              if (result && typeof result === "object") {
+                const r = result;
+                return {
+                  content: typeof r.output === "string" ? r.output : "",
+                  metadata: {
+                    ...r.metadata || {},
+                    ...r.title ? { title: r.title } : {}
+                  }
+                };
+              }
+              return { content: String(result ?? "") };
+            }
+          });
+        } catch (error) {
+          console.error(`[opencode-scheduler-v2] failed to register ${name}:`, error);
+        }
+      }
+    });
+  }
+};
+var src_default = {
+  id: "opencode-scheduler",
+  server: SchedulerPlugin,
+  setup: SchedulerPluginV2.setup
+};
 export {
   SchedulerPlugin,
   src_default as default,
